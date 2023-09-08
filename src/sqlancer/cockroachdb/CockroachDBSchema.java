@@ -1,20 +1,17 @@
 package sqlancer.cockroachdb;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.List;
-
 import sqlancer.Randomly;
 import sqlancer.SQLConnection;
 import sqlancer.cockroachdb.CockroachDBProvider.CockroachDBGlobalState;
 import sqlancer.cockroachdb.CockroachDBSchema.CockroachDBTable;
-import sqlancer.common.schema.AbstractRelationalTable;
-import sqlancer.common.schema.AbstractSchema;
-import sqlancer.common.schema.AbstractTableColumn;
-import sqlancer.common.schema.AbstractTables;
-import sqlancer.common.schema.TableIndex;
+import sqlancer.common.schema.*;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 public class CockroachDBSchema extends AbstractSchema<CockroachDBGlobalState, CockroachDBTable> {
 
@@ -24,7 +21,11 @@ public class CockroachDBSchema extends AbstractSchema<CockroachDBGlobalState, Co
         TIMETZ, ARRAY;
 
         public static CockroachDBDataType getRandom() {
-            return Randomly.fromOptions(values());
+            // TODO(srosenberg): INTERVAL and JSONB can trigger a number of known issues, e.g., [1], so we skip them.
+            // [1] https://github.com/cockroachdb/cockroach/issues/45993
+            CockroachDBDataType[] filteredVals =
+                    Arrays.asList(values()).stream().filter(e -> e != INTERVAL && e != JSONB).toArray(CockroachDBDataType[]::new);
+            return Randomly.fromOptions(filteredVals);
         }
 
         public CockroachDBCompositeDataType get() {

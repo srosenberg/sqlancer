@@ -85,13 +85,7 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
         }), //
         SCRUB((g) -> new SQLQueryAdapter(
                 "EXPERIMENTAL SCRUB table " + g.getSchema().getRandomTable(t -> !t.isView()).getName(),
-                // https://github.com/cockroachdb/cockroach/issues/46401
-                ExpectedErrors.from("scrub-fk: column \"t.rowid\" does not exist",
-                        "check-constraint: cannot access temporary tables of other sessions" /*
-                                                                                              * https:// github. com/
-                                                                                              * cockroachdb / cockroach
-                                                                                              * /issues/ 47031
-                                                                                              */))), //
+                new ExpectedErrors())),
         SPLIT((g) -> {
             StringBuilder sb = new StringBuilder("ALTER INDEX ");
             CockroachDBTable randomTable = g.getSchema().getRandomTable();
@@ -105,6 +99,25 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
             }
             return new SQLQueryAdapter(sb.toString(), ExpectedErrors.from("must be of type"));
         });
+        // TODO(srosenberg): VALIDATE CONSTRAINT works only with explicit constraints added via 'CHECK'. It errors
+        // out on implicit constraints like primary key and UNIQUE and supports only non-index-backed constraints.
+        // Thus, the following doesn't result in anything interesting until we generate 'CHECK' constraints.
+//        VALIDATE_CONSTRAINT((g) -> {
+//            StringBuilder sb = new StringBuilder("ALTER table ");
+//            CockroachDBTable randomTable = g.getSchema().getRandomTable();
+//            sb.append(randomTable.getName());
+//            sb.append(" VALIDATE CONSTRAINT ");
+//            List<TableIndex> indexes = randomTable.getIndexes();
+//            if (indexes.isEmpty()) {
+//                throw new IgnoreMeException();
+//            }
+//            for (TableIndex index : indexes) {
+//                index.
+//            }
+//            TableIndex index = Randomly.fromList(indexes);
+//            sb.append(index.getIndexName());
+//            return new SQLQueryAdapter(sb.toString(), new ExpectedErrors());
+//        });
 
         private final SQLQueryProvider<CockroachDBGlobalState> sqlQueryProvider;
 
@@ -140,7 +153,8 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
         standardSettings.add("SET CLUSTER SETTING sql.metrics.statement_details.enabled = 'off'");
         standardSettings.add("SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = 'off'");
         standardSettings.add("SET CLUSTER SETTING sql.stats.automatic_collection.enabled = 'off'");
-        standardSettings.add("SET CLUSTER SETTING timeseries.storage.enabled = 'off'");
+        // N.B. disabling timeseries.storage effectively means no metrics in the DB Console, so let's keep them.
+        standardSettings.add("SET CLUSTER SETTING timeseries.storage.enabled = 'on'");
 
         if (globalState.getDbmsSpecificOptions().testHashIndexes) {
             standardSettings.add("set experimental_enable_hash_sharded_indexes='on';");
@@ -176,7 +190,7 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
                 break;
             case UPDATE:
             case SPLIT:
-                nrPerformed = globalState.getRandomly().getInteger(0, 3);
+                nrPerformed = globalState.getRandomly().getInteger(0, 5);
                 break;
             case EXPLAIN:
                 nrPerformed = globalState.getRandomly().getInteger(0, 10);
@@ -198,13 +212,18 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
                 nrPerformed = globalState.getRandomly().getInteger(0, 10);
                 break;
             case COMMENT_ON:
-            case SCRUB:
-                nrPerformed = 0; /*
-                                  * there are a number of open SCRUB bugs, of which
-                                  * https://github.com/cockroachdb/cockroach/issues/47116 crashes the server
-                                  */
+                nrPerformed = globalState.getRandomly().getInteger(0, 2);
                 break;
+            case SCRUB:
+                nrPerformed = globalState.getRandomly().getInteger(0, 7);
+                break;
+                //TODO(srosenberg): disabled until 'CHECK' constraints are generated; see above.
+//            case VALIDATE_CONSTRAINT:
+//                nrPerformed = globalState.getRandomly().getInteger(0, 10);
+//                break;
             case TRANSACTION:
+                nrPerformed = globalState.getRandomly().getInteger(0, 3);
+                break;
             case CREATE_TABLE:
             case DROP_TABLE:
             case DROP_VIEW:
@@ -263,6 +282,44 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
         }
     }
 
+    // Constructs a full pgurl of the following forms,
+    //
+    // 1. jdbc:postgresql://$host:$port/$db
+    // 2. jdbc:postgresql://$host_1:$port,$host_2:$port,...,$host_n:$port/$db?loadBalanceHosts=true
+    // 3. jdbc:postgresql://$host:$port/$db?query_options
+    //
+    // depending on the 'host' specification. If the host contains '?', then form 3 is used,
+    // by merely replacing encoded database name with the specified one. If the host contains ',', then form 2 is used.
+    // Otherwise, form 1 is used.
+    String buildPGUrl(String host, int port, String databaseName) throws SQLException {
+        String url = String.format("jdbc:postgresql://%s:%d/%s", host, port, databaseName);
+
+        if (host.contains("?")) {
+            // assume host encodes a complete pgurl; attempt to replace the database name between '/' and '?'
+            int endIndex = host.indexOf('?');
+            int startIndex = host.lastIndexOf('/');
+            if (startIndex != -1 && startIndex < endIndex) {
+                host = host.substring(0, startIndex) + "/" + databaseName + "?" + host.substring(endIndex+1);
+                url = String.format("jdbc:postgresql://%s", host);
+            } else {
+                throw new SQLException("'host' encodes an invalid pgurl: " + host);
+            }
+        } else if (host.indexOf(',') != -1) {
+            String[] hosts = host.split(",");
+            StringBuilder hostAndPort = new StringBuilder();
+            String sep = "";
+            for (String h : hosts) {
+                hostAndPort.append(sep);
+                hostAndPort.append(h);
+                hostAndPort.append(":");
+                hostAndPort.append(port);
+                sep = ",";
+            }
+            url = String.format("jdbc:postgresql://%s/%s?loadBalanceHosts=true", hostAndPort, databaseName);
+        }
+        return url;
+    }
+
     @Override
     public SQLConnection createDatabase(CockroachDBGlobalState globalState) throws SQLException {
         String host = globalState.getOptions().getHost();
@@ -274,10 +331,13 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
             port = CockroachDBOptions.DEFAULT_PORT;
         }
         String databaseName = globalState.getDatabaseName();
-        String url = String.format("jdbc:postgresql://%s:%d/test", host, port);
+        String url = buildPGUrl(host, port, databaseName);
+        System.out.println("JDBC url="+ url);
+
         Connection con = DriverManager.getConnection(url, globalState.getOptions().getUserName(),
                 globalState.getOptions().getPassword());
-        globalState.getState().logStatement("USE test");
+        // N.B. 'defaultdb' is always there and never goes away, use it to drop/create other databases.
+        globalState.getState().logStatement("USE defaultdb");
         globalState.getState().logStatement("DROP DATABASE IF EXISTS " + databaseName + " CASCADE");
         String createDatabaseCommand = "CREATE DATABASE " + databaseName;
         globalState.getState().logStatement(createDatabaseCommand);
@@ -289,7 +349,8 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
             s.execute(createDatabaseCommand);
         }
         con.close();
-        con = DriverManager.getConnection(String.format("jdbc:postgresql://%s:%d/%s", host, port, databaseName),
+
+        con = DriverManager.getConnection(url,
                 globalState.getOptions().getUserName(), globalState.getOptions().getPassword());
         return new SQLConnection(con);
     }
@@ -335,7 +396,7 @@ public class CockroachDBProvider extends SQLProviderAdapter<CockroachDBGlobalSta
                 }
             }
         } catch (AssertionError e) {
-            throw new AssertionError("Explain failed: " + explainQuery);
+            throw new AssertionError("Explain failed: " + explainQuery, e);
         }
 
         return queryPlan;
